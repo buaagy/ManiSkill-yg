@@ -574,7 +574,10 @@ if __name__ == "__main__":
                     with torch.no_grad():
                         _, log_pi, _ = actor.get_action(data.obs)
                     # 计算 alpha 损失
+                    # if args.correct_alpha:
                     alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                    # else:
+                    #     alpha_loss = (-log_alpha * (log_pi + target_entropy)).mean()
                     # log_alpha 有历史原因: https://github.com/rail-berkeley/softlearning/issues/136#issuecomment-619535356
 
                     # 更新 alpha

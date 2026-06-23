@@ -313,6 +313,7 @@ class Agent(nn.Module):
         super().__init__()
         # 特征提取网络
         self.feature_net = NatureCNN(sample_obs=sample_obs)
+        # latent_size = np.array(envs.unwrapped.single_observation_space.shape).prod()
         latent_size = self.feature_net.out_features
         
         # 评论家网络, 用于估计状态价值
