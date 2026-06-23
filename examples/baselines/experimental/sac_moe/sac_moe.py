@@ -1,4 +1,3 @@
-
 from collections import defaultdict
 from dataclasses import dataclass
 import os
@@ -27,6 +26,7 @@ import mani_skill.envs
 
 @dataclass
 class Args:
+    # 实验配置参数
     exp_name: Optional[str] = None
     """the name of this experiment"""
     seed: int = 1
@@ -56,7 +56,7 @@ class Args:
     log_freq: int = 1_000
     """logging frequency in terms of environment steps"""
 
-    # Environment specific arguments
+    # 环境相关参数
     env_id: str = "PickCube-v1"
     """the id of the environment"""
     env_vectorization: str = "gpu"
@@ -84,7 +84,7 @@ class Args:
     control_mode: Optional[str] = "pd_joint_delta_pos"
     """the control mode to use for the environment"""
 
-    # Algorithm specific arguments
+    # 算法相关参数
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
     buffer_size: int = 1_000_000
@@ -120,12 +120,14 @@ class Args:
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
 
-    # to be filled in runtime
+    # 运行时填充的参数
     grad_steps_per_iteration: int = 0
     """the number of gradient updates per iteration"""
     steps_per_env: int = 0
     """the number of steps each parallel env takes per iteration"""
 
+
+# 经验回放缓冲区样本类
 @dataclass
 class ReplayBufferSample:
     obs: torch.Tensor
@@ -133,6 +135,9 @@ class ReplayBufferSample:
     actions: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
+
+
+# 经验回放缓冲区
 class ReplayBuffer:
     def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
         self.buffer_size = buffer_size
@@ -169,6 +174,7 @@ class ReplayBuffer:
         if self.pos == self.per_env_buffer_size:
             self.full = True
             self.pos = 0
+            
     def sample(self, batch_size: int):
         if self.full:
             batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
@@ -183,7 +189,9 @@ class ReplayBuffer:
             dones=self.dones[batch_inds, env_inds].to(self.sample_device)
         )
 
-# ALGO LOGIC: initialize agent here:
+
+# 算法逻辑: 初始化智能体
+# 门控网络 (Gating Network), 用于选择专家
 class Gating(nn.Module): 
     def __init__(self, input_dim, 
                  num_experts, dropout_rate=0.1): 
@@ -216,6 +224,8 @@ class Gating(nn.Module):
 
         return torch.softmax(self.layer4(x), dim=1)
 
+
+# 混合专家网络
 class MoE(nn.Module): 
     def __init__(self, num_experts, expert_module, env):
         super(MoE, self).__init__() 
@@ -234,6 +244,8 @@ class MoE(nn.Module):
         weights = weights.unsqueeze(1).expand_as(outputs) 
         return torch.sum(outputs * weights, dim=-1)
      
+
+# 价值网络
 class VNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
@@ -250,6 +262,8 @@ class VNetwork(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
+# 软Q网络
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
@@ -271,6 +285,7 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
 
+# Actor网络 (策略网络)
 class Actor(nn.Module):
     def __init__(self, env):
         super().__init__()
@@ -324,16 +339,21 @@ class Actor(nn.Module):
         self.action_bias = self.action_bias.to(device)
         return super().to(device)
 
+
+# 日志记录器
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
+        
     def add_scalar(self, tag, scalar_value, step):
         if self.log_wandb:
             wandb.log({tag: scalar_value}, step=step)
         self.writer.add_scalar(tag, scalar_value, step)
+        
     def close(self):
         self.writer.close()
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -345,7 +365,7 @@ if __name__ == "__main__":
     else:
         run_name = args.exp_name
 
-    # TRY NOT TO MODIFY: seeding
+    # 设置随机种子
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -353,7 +373,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    ####### Environment setup #######
+    ####### 环境设置 #######
     env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="gpu")
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
@@ -405,6 +425,7 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
+    # 初始化网络
     actor = Actor(envs).to(device)
     value_predictor = MoE(4, VNetwork, envs).to(device)
     qf1 = MoE(4, SoftQNetwork, envs).to(device)
@@ -422,7 +443,7 @@ if __name__ == "__main__":
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
     predictor_optimizer = optim.Adam(list(value_predictor.parameters()), lr=args.q_lr)
 
-    # Automatic entropy tuning
+    # 自动熵调优
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
@@ -441,7 +462,7 @@ if __name__ == "__main__":
     )
 
 
-    # TRY NOT TO MODIFY: start the game
+    # 开始训练
     obs, info = envs.reset(seed=args.seed) # in Gymnasium, seed is given to reset() instead of seed()
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     global_step = 0
@@ -454,7 +475,7 @@ if __name__ == "__main__":
 
     while global_step < args.total_timesteps:
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
-            # evaluate
+            # 评估
             actor.eval()
             stime = time.perf_counter()
             eval_obs, _ = eval_envs.reset()
@@ -497,19 +518,19 @@ if __name__ == "__main__":
                 }, model_path)
                 print(f"model saved to {model_path}")
 
-        # Collect samples from environemnts
+        # 从环境中收集样本
         rollout_time = time.perf_counter()
         for local_step in range(args.steps_per_env):
             global_step += 1 * args.num_envs
 
-            # ALGO LOGIC: put action logic here
+            # 算法逻辑: 放置动作选择逻辑
             if not learning_has_started:
                 actions = torch.tensor(envs.action_space.sample(), dtype=torch.float32, device=device)
             else:
                 actions, _, _ = actor.get_action(obs)
                 actions = actions.detach()
 
-            # TRY NOT TO MODIFY: execute the game and log data.
+            # 执行游戏并记录数据
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
             real_next_obs = next_obs.clone()
             if args.bootstrap_at_done == 'never':
@@ -531,13 +552,13 @@ if __name__ == "__main__":
 
             rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
 
-            # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+            # 关键步骤: 更新观测
             obs = next_obs
         rollout_time = time.perf_counter() - rollout_time
         cumulative_times["rollout_time"] += rollout_time
         pbar.update(args.num_envs * args.steps_per_env)
 
-        # ALGO LOGIC: training.
+        # 算法逻辑: 训练
         if global_step < args.learning_starts:
             continue
 
@@ -547,7 +568,7 @@ if __name__ == "__main__":
             global_update += 1
             data = rb.sample(args.batch_size)
 
-            # update the value networks
+            # 更新价值网络
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_obs)
                 qf1_next_target = qf1_target(data.next_obs, next_state_actions)
@@ -584,7 +605,7 @@ if __name__ == "__main__":
             predictor_loss.backward()
             predictor_optimizer.step()
 
-            # update the policy network
+            # 更新策略网络
             if global_update % args.policy_frequency == 0:  # TD 3 Delayed update support
                 pi, log_pi, _ = actor.get_action(data.obs)
                 qf1_pi = qf1(data.obs, pi)
@@ -610,7 +631,7 @@ if __name__ == "__main__":
                     a_optimizer.step()
                     alpha = log_alpha.exp().item()
 
-            # update the target networks
+            # 更新目标网络
             if global_update % args.target_network_frequency == 0:
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
@@ -619,7 +640,7 @@ if __name__ == "__main__":
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
 
-        # Log training-related data
+        # 记录训练相关数据
         if (global_step - args.training_freq) // args.log_freq < global_step // args.log_freq:
             logger.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
             logger.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
