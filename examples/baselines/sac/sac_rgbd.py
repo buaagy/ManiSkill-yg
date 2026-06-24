@@ -25,6 +25,12 @@ import tyro  # 命令行参数解析库
 
 import mani_skill.envs
 
+# 复用 sac_moe 文件夹中已创建的 jepa.py 辅助模块
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "experimental" / "sac_moe"))
+from jepa import JEPA, JEPAConfig
+
 
 @dataclass
 class Args:
@@ -131,6 +137,16 @@ class Args:
     """相机图像的宽度. 如果为 None, 将使用环境指定的默认值"""
     camera_height: Optional[int] = None
     """相机图像的高度. 如果为 None, 将使用环境指定的默认值"""
+
+    # JEPA 辅助模块参数
+    use_jepa: bool = False
+    """如果启用, 在训练期间开启动作条件的 JEPA 辅助损失模块."""
+    jepa_lr: float = 3e-4
+    """JEPA predictor 优化器的学习率."""
+    jepa_hidden_dims: str = "256,256"
+    """JEPA predictor MLP 的隐藏层维度 (逗号分隔)."""
+    jepa_update_encoder: bool = False
+    """如果启用, JEPA 优化器也会更新共享 encoder. 默认 False (encoder 仅由 SAC 更新)."""
 
     # 运行时填充的参数
     grad_steps_per_iteration: int = 0
@@ -646,6 +662,23 @@ if __name__ == "__main__":
         lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
+    # JEPA 辅助模块 (可选): 与 actor.encoder 共享同一个 Encoder 实例, 独立 Predictor 和 Optimizer
+    jepa = None
+    if args.use_jepa:
+        jepa_hidden_dims = tuple(int(x) for x in args.jepa_hidden_dims.split(",") if x.strip() != "")
+        jepa_config = JEPAConfig(
+            latent_dim=actor.encoder.encoder.out_dim,
+            hidden_dims=jepa_hidden_dims,
+            lr=args.jepa_lr,
+            update_encoder=args.jepa_update_encoder,
+        )
+        jepa = JEPA(
+            encoder=actor.encoder,
+            action_dim=int(np.prod(envs.single_action_space.shape)),
+            config=jepa_config,
+            device=device,
+        )
+
     # 自动熵调整
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
@@ -837,6 +870,10 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
+            # JEPA 辅助损失更新 (独立 Predictor / Optimizer, 不影响 SAC Loss)
+            if args.use_jepa and jepa is not None:
+                jepa.update(data.obs, data.next_obs, data.actions)
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
 
@@ -857,6 +894,8 @@ if __name__ == "__main__":
             logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
             if args.autotune:
                 logger.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+            if args.use_jepa and jepa is not None:
+                logger.add_scalar("losses/jepa_loss", jepa.get_last_loss(), global_step)
 
     # 保存最终模型
     if not args.evaluate and args.save_model:
