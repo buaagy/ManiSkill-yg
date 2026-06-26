@@ -1,4 +1,3 @@
-
 # 导入必要的库
 from collections import defaultdict
 from dataclasses import dataclass
@@ -153,6 +152,7 @@ class Args:
     """每次迭代的梯度更新次数"""
     steps_per_env: int = 0
     """每次迭代每个并行环境执行的步数"""
+    
 # 字典数组类, 用于存储字典形式的观测数据
 class DictArray(object):
     def __init__(self, buffer_shape, element_space, data_dict=None, device=None):
@@ -175,6 +175,12 @@ class DictArray(object):
                     self.data[k] = torch.zeros(buffer_shape + v.shape, dtype=dtype, device=device)
 
     def keys(self):
+
+        """返回字典中所有的键
+        
+        Returns:
+            dict_keys: 包含字典中所有键的视图对象
+        """
         return self.data.keys()
 
     def __getitem__(self, index):
@@ -381,6 +387,7 @@ class PlainConv(nn.Module):
 #                 obs = obs / 255
 #             encoded_tensor_list.append(extractor(obs))
 #         return torch.cat(encoded_tensor_list, dim=1)
+
 # 编码器观测包装器, 用于处理字典形式的观测
 class EncoderObsWrapper(nn.Module):
     def __init__(self, encoder):
@@ -408,25 +415,55 @@ class EncoderObsWrapper(nn.Module):
         return self.encoder(img)
 
 # 创建多层感知机 (MLP)
+#
+# 该函数根据给定的输入维度和各层输出维度列表, 依次堆叠 nn.Linear 线性层和激活函数,
+# 返回一个 nn.Sequential 容器. 常用于构建策略网络、Q 网络以及视觉编码器末端的特征投影模块.
+#
+# 参数:
+#   in_channels  (int)               : 输入特征维度 (第一层 Linear 的 in_features).
+#   mlp_channels (list[int])         : 各层输出维度列表, 列表长度即为 MLP 的层数.
+#   act_builder  (callable, 可选)    : 激活函数构造器, 默认为 nn.ReLU.
+#                                       传入构造器 (而非实例) 以便每层创建独立的激活函数模块.
+#   last_act     (bool, 可选)        : 是否在最后一层 Linear 之后也添加激活函数.
+#                                       - True : 每层 Linear 后都接激活函数 (适用于特征提取/编码器主体).
+#                                       - False: 最后一层 Linear 不接激活函数 (适用于输出 Q 值等回归任务).
+#
+# 返回:
+#   nn.Sequential : 由 Linear 层和激活函数交替组成的顺序模型.
 def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
-    c_in = in_channels
-    module_list = []
+    c_in = in_channels  # 当前层的输入维度, 初始化为整体输入维度
+    module_list = []    # 用于按顺序存放每一层的模块
+    # 遍历每一层的输出维度, 逐层构建 Linear + 激活函数
     for idx, c_out in enumerate(mlp_channels):
+        # 添加当前层的线性变换: y = Wx + b
         module_list.append(nn.Linear(c_in, c_out))
+        # 判断是否添加激活函数:
+        #   - 若 last_act 为 True, 则所有层 (包括最后一层) 均添加激活函数;
+        #   - 若 last_act 为 False, 则除最后一层外均添加激活函数 (idx < len(mlp_channels) - 1).
         if last_act or idx < len(mlp_channels) - 1:
             module_list.append(act_builder())
-        c_in = c_out
+        c_in = c_out  # 更新下一层的输入维度为当前层的输出维度
+    # 将所有模块封装为 nn.Sequential, 以便像单模块一样前向调用
     return nn.Sequential(*module_list)
 
 # Soft Q 网络 (用于估计状态-动作对的价值)
+# Q(s, a) 近似软 Bellman 方程中的 Q 值函数:
+# Q(s, a) ≈ r + γ * E_{s'~p, a'~π}[Q(s', a') - α * log π(a'|s')]
 class SoftQNetwork(nn.Module):
     def __init__(self, envs, encoder: EncoderObsWrapper):
         super().__init__()
         self.encoder = encoder
         action_dim = np.prod(envs.single_action_space.shape)
         state_dim = envs.single_observation_space['state'].shape[0]
+        # 打印维度信息
+        print(f"[SoftQNetwork] 维度信息:")
+        print(f"  - 视觉特征维度 (encoder.out_dim): {encoder.encoder.out_dim}")
+        print(f"  - 动作维度 (action_dim): {action_dim}")
+        print(f"  - 状态维度 (state_dim): {state_dim}")
+        print(f"  - 输入总维度 (visual + state + action): {encoder.encoder.out_dim + action_dim + state_dim}")
+        print(f"  - MLP 隐藏层维度: [512, 256, 1]")
         # 网络结构: 视觉特征 + 状态 + 动作 -> 512 -> 256 -> 1 (Q值)
-        self.mlp = make_mlp(encoder.encoder.out_dim+action_dim+state_dim, [512, 256, 1], last_act=False)
+        self.mlp = make_mlp(encoder.encoder.out_dim + action_dim + state_dim, [512, 256, 1], last_act=False)
 
     def forward(self, obs, action, visual_feature=None, detach_encoder=False):
         # 如果没有提供视觉特征, 使用编码器提取
@@ -445,6 +482,9 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
 # Actor 网络 (策略网络)
+# 策略网络 π(a|s) 输出动作分布的均值 μ(s) 和标准差 σ(s)
+# 使用 tanh 高斯策略: a = tanh(μ(s) + σ(s) * ε), ε ~ N(0, I)
+# 对应的概率密度为: π(a|s) = N(u; μ(s), σ(s)) * |det(da/du)|^{-1}
 class Actor(nn.Module):
     def __init__(self, envs, sample_obs):
         super().__init__()
@@ -497,6 +537,11 @@ class Actor(nn.Module):
         return action
 
     # 获取训练动作 (随机策略)
+    # 使用重参数化技巧 (Reparameterization Trick):
+    #   u = μ(s) + σ(s) * ε, ε ~ N(0, I)
+    #   a = tanh(u) * scale + bias
+    # 对数概率 (考虑 tanh 变换的 Jacobian 修正):
+    #   log π(a|s) = log N(u; μ(s), σ(s)) - Σ log(scale * (1 - tanh²(u)) + ε)
     def get_action(self, obs, detach_encoder=False):
         mean, log_std, visual_feature = self(obs, detach_encoder)
         std = log_std.exp()
@@ -506,7 +551,7 @@ class Actor(nn.Module):
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
-        # 强制动作边界
+        # 强制动作边界, 修正 tanh 变换的对数概率: log|da/du| = log(scale * (1 - tanh²(u)))
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
@@ -535,8 +580,8 @@ if __name__ == "__main__":
     # 解析命令行参数
     args = tyro.cli(Args)
     # 计算运行时参数
-    args.grad_steps_per_iteration = int(args.training_freq * args.utd)
-    args.steps_per_env = args.training_freq // args.num_envs
+    args.grad_steps_per_iteration = int(args.training_freq * args.utd) # 64 * 0.25 = 16
+    args.steps_per_env = args.training_freq // args.num_envs # 64 / 32 = 2
     # 设置实验名称
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
@@ -633,18 +678,17 @@ if __name__ == "__main__":
         storage_device=torch.device(args.buffer_device),
         sample_device=device
     )
-
-
+    
     # 开始训练
     obs, info = envs.reset(seed=args.seed) # 在 Gymnasium 中, seed 传给 reset() 而不是 seed()
     eval_obs, _ = eval_envs.reset(seed=args.seed)
 
     # 架构说明: 所有 actor 和 q-network 共享相同的视觉编码器. 编码器的输出与任何状态数据拼接, 后面跟随单独的 MLPs
     actor = Actor(envs, sample_obs=obs).to(device)
-    qf1 = SoftQNetwork(envs, actor.encoder).to(device)
-    qf2 = SoftQNetwork(envs, actor.encoder).to(device)
-    qf1_target = SoftQNetwork(envs, actor.encoder).to(device)
-    qf2_target = SoftQNetwork(envs, actor.encoder).to(device)
+    qf1 = SoftQNetwork(envs, actor.encoder).to(device)  # 第一个软Q网络
+    qf2 = SoftQNetwork(envs, actor.encoder).to(device)  # 第二个软Q网络，用于双重Q学习以减少过拟合
+    qf1_target = SoftQNetwork(envs, actor.encoder).to(device)  # 第一个目标软Q网络，用于稳定训练
+    qf2_target = SoftQNetwork(envs, actor.encoder).to(device)  # 第二个目标软Q网络，同样用于双重Q学习
     # 如果有检查点, 加载模型
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint)
@@ -663,15 +707,27 @@ if __name__ == "__main__":
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # JEPA 辅助模块 (可选): 与 actor.encoder 共享同一个 Encoder 实例, 独立 Predictor 和 Optimizer
-    jepa = None
+    jepa = None # 初始化jepa变量为None
+    # 如果参数中指定使用jepa
     if args.use_jepa:
+        # 将jepa隐藏维度参数字符串转换为整数元组
         jepa_hidden_dims = tuple(int(x) for x in args.jepa_hidden_dims.split(",") if x.strip() != "")
+        # 创建jepa配置对象，包含以下参数：
+        # latent_dim: 编码器的输出维度
+        # hidden_dims: jepa的隐藏层维度
+        # lr: 学习率
+        # update_encoder: 是否更新编码器
         jepa_config = JEPAConfig(
             latent_dim=actor.encoder.encoder.out_dim,
             hidden_dims=jepa_hidden_dims,
             lr=args.jepa_lr,
             update_encoder=args.jepa_update_encoder,
         )
+        # 创建JEPA模型实例，传入以下参数：
+        # encoder: 编码器
+        # action_dim: 动作维度（通过环境动作空间形状计算）
+        # config: jepa配置
+        # device: 计算设备
         jepa = JEPA(
             encoder=actor.encoder,
             action_dim=int(np.prod(envs.single_action_space.shape)),
@@ -680,6 +736,9 @@ if __name__ == "__main__":
         )
 
     # 自动熵调整
+    # 目标熵: H_target = -|A| (动作维度的负数)
+    # 熵系数 α 通过以下损失自动调整:
+    #   J(α) = E[-α * (log π(a|s) + H_target)]
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
@@ -724,8 +783,10 @@ if __name__ == "__main__":
                     logger.add_scalar(f"eval/{k}", mean, global_step)
             # 更新进度条描述
             pbar.set_description(
-                f"success_once: {eval_metrics_mean['success_once']:.2f}, "
-                f"return: {eval_metrics_mean['return']:.2f}"
+                # f"success_once: {eval_metrics_mean['success_once']:.2f}, "
+                # f"return: {eval_metrics_mean['return']:.2f}"
+                f"success_once: {eval_metrics_mean.get('success_once', 0.0):.2f}, "
+                f"return: {eval_metrics_mean.get('return', 0.0):.2f}"
             )
             if logger is not None:
                 eval_time = time.perf_counter() - stime
@@ -751,7 +812,7 @@ if __name__ == "__main__":
         # 从环境收集样本 (数据收集阶段)
         rollout_time = time.perf_counter()
         for local_step in range(args.steps_per_env):
-            global_step += 1 * args.num_envs
+            global_step += 1 * args.num_envs # 每个环境步增加 num_envs 个全局步数
 
             # 算法逻辑: 在此放置动作选择逻辑
             if not learning_has_started:
@@ -800,6 +861,7 @@ if __name__ == "__main__":
 
         update_time = time.perf_counter()
         learning_has_started = True
+        
         # 执行多次梯度更新
         for local_update in range(args.grad_steps_per_iteration):
             global_update += 1
@@ -807,15 +869,18 @@ if __name__ == "__main__":
             data = rb.sample(args.batch_size)
 
             # 更新价值网络 (Q 网络)
+            # 软 Bellman 目标值:
+            # y = r + γ * (1 - done) * (min(Q₁'(s', a'), Q₂'(s', a')) - α * log π(a'|s'))
+            # 其中 a' ~ π(·|s'), Q' 为目标网络
             with torch.no_grad():
                 # 获取下一状态的动作和策略熵
                 next_state_actions, next_state_log_pi, _, visual_feature = actor.get_action(data.next_obs)
                 # 计算目标 Q 值
                 qf1_next_target = qf1_target(data.next_obs, next_state_actions, visual_feature)
                 qf2_next_target = qf2_target(data.next_obs, next_state_actions, visual_feature)
-                # 取最小值并减去熵正则化项
+                # 取最小值并减去熵正则化项: min(Q₁', Q₂') - α * log π
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                # 计算目标 Q 值: reward + gamma * (1 - done) * min_qf_next
+                # 计算目标 Q 值: y = r + γ * (1 - done) * (min_qf_next - α * log π)
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
                 # data.dones 是 "stop_bootstrap", 根据前面的 args.bootstrap_at_done 计算
             # 提取当前状态的特征
@@ -823,7 +888,7 @@ if __name__ == "__main__":
             # 计算 Q 值
             qf1_a_values = qf1(data.obs, data.actions, visual_feature).view(-1)
             qf2_a_values = qf2(data.obs, data.actions, visual_feature).view(-1)
-            # 计算 Q 网络损失
+            # 计算 Q 网络损失 (均方误差): L_Q = E[(Q(s,a) - y)²]
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -834,13 +899,16 @@ if __name__ == "__main__":
             q_optimizer.step()
 
             # 更新策略网络
+            # 策略损失 (最大化期望回报 + 熵):
+            # J_π = E_{s~D, a~π}[α * log π(a|s) - min(Q₁(s,a), Q₂(s,a))]
+            # 即最小化: L_π = E[α * log π(a|s) - min(Q₁(s,a), Q₂(s,a))]
             if global_update % args.policy_frequency == 0:  # TD3 延迟更新支持
                 pi, log_pi, _, visual_feature = actor.get_action(data.obs)
                 # 计算 Q 值 (detach_encoder=True 防止梯度流回编码器)
                 qf1_pi = qf1(data.obs, pi, visual_feature, detach_encoder=True)
                 qf2_pi = qf2(data.obs, pi, visual_feature, detach_encoder=True)
                 min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                # 计算策略损失: alpha * log_pi - min_qf_pi
+                # 计算策略损失: L_π = E[α * log π(a|s) - min(Q₁(s,a), Q₂(s,a))]
                 actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
                 # 优化策略网络
@@ -849,6 +917,8 @@ if __name__ == "__main__":
                 actor_optimizer.step()
 
                 # 自动调整熵系数
+                # 熵系数损失: J(α) = E[-α * (log π(a|s) + H_target)]
+                # 其中 H_target 为目标熵, 通常取 -|A|
                 if args.autotune:
                     with torch.no_grad():
                         _, log_pi, _, _ = actor.get_action(data.obs)
@@ -865,6 +935,8 @@ if __name__ == "__main__":
                     alpha = log_alpha.exp().item()
 
             # 更新目标网络 (软更新)
+            # 目标网络软更新公式: θ' ← τ * θ + (1 - τ) * θ'
+            # 其中 τ 为平滑系数 (较小的值, 如 0.01)
             if global_update % args.target_network_frequency == 0:
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
