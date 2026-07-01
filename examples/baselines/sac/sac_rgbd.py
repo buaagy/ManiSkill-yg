@@ -80,8 +80,8 @@ class Args:
     """是否让并行环境在终止时重置而不是截断时重置"""
     eval_partial_reset: bool = False
     """是否让并行评估环境在终止时重置而不是截断时重置"""
-    num_steps: int = 50
-    """每次策略 rollout 在每个环境中运行的步数"""
+    num_steps: int = 150
+    """单 episode 最大截断 horizon, 与ppo算法中的意义不同(ppo是每次策略 rollout 在每个环境中运行的步数)"""
     num_eval_steps: int = 50
     """评估期间在每个评估环境中运行的步数"""
     reconfiguration_freq: Optional[int] = None
@@ -220,30 +220,93 @@ class ReplayBufferSample:
     rewards: torch.Tensor  # 获得的奖励
     dones: torch.Tensor  # 是否终止
 
-# 经验回放缓冲区类 (支持字典观测)
+# ============================================================================
+# 经验回放缓冲区类 (Experience Replay Buffer, 支持字典观测)
+# ----------------------------------------------------------------------------
+# 作用:
+#   在 SAC 等 off-policy 强化学习算法中, 用于存储智能体与环境交互产生的
+#   转移样本 (s, a, r, s', done), 并支持从中随机均匀采样小批量数据进行训练.
+#   随机采样可以打破样本间的时间相关性, 使训练数据更接近 i.i.d. 假设,
+#   从而提升梯度估计的无偏性与训练稳定性.
+#
+# 设计要点:
+#   1. 并行环境: 同时管理 num_envs 个并行环境的转移, 每个环境独立维护时间轴.
+#      缓冲区形状为 (per_env_buffer_size, num_envs), 其中
+#      per_env_buffer_size = buffer_size // num_envs 为每个环境可存储的最大步数.
+#   2. 字典观测: 观测 (obs/next_obs) 为嵌套字典结构 (如 {'rgb':..., 'state':...}),
+#      使用 DictArray 存储; 动作、奖励、终止标志等为普通张量.
+#   3. 设备分离: 存储设备 (storage_device) 与采样设备 (sample_device) 可不同.
+#      - 存储设备通常为 CPU (节省显存) 或 GPU (加速采样);
+#      - 采样设备为模型所在设备 (一般为 GPU), 采样时自动迁移数据.
+#   4. 环形缓冲区: 写满后从头部覆盖旧数据, 保证缓冲区大小恒定且无需动态分配.
+#   5. 未使用字段: logprobs / values 在本 SAC 脚本中未实际写入 (add 未传入),
+#      保留是为了与 PPO 等其他算法共享同一缓冲区结构, 方便代码复用.
+# ============================================================================
 class ReplayBuffer:
+    # ------------------------------------------------------------------------
+    # 构造函数: 根据环境信息预分配所有存储张量
+    #
+    # 参数:
+    #   env             : 向量环境实例, 用于读取 single_observation_space
+    #                     和 single_action_space 以推断各张量的形状与数据类型.
+    #   num_envs        : 并行环境数量, 决定缓冲区第 1 维 (环境维) 的大小.
+    #   buffer_size     : 缓冲区总容量 (跨所有环境的总步数), 会按 num_envs 均分.
+    #   storage_device  : 实际存放张量的设备 (如 torch.device('cpu') 或 'cuda').
+    #   sample_device   : 采样后返回数据所在设备, 通常与模型参数所在设备一致.
+    # ------------------------------------------------------------------------
     def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
-        self.buffer_size = buffer_size  # 缓冲区总大小
-        self.pos = 0  # 当前写入位置
-        self.full = False  # 缓冲区是否已满
+        self.buffer_size = buffer_size  # 缓冲区总容量 (所有环境合计的步数)
+        self.pos = 0  # 当前写入的时间步位置 (指向 per_env_buffer_size 维度的索引)
+        self.full = False  # 缓冲区是否已写满至少一轮 (用于采样范围判断)
         self.num_envs = num_envs  # 并行环境数量
-        self.storage_device = storage_device  # 存储设备
-        self.sample_device = sample_device  # 采样设备
+        self.storage_device = storage_device  # 数据存储设备 (CPU/GPU)
+        self.sample_device = sample_device  # 采样返回数据的目标设备
+        # 每个环境可存储的最大步数: 总容量按环境数均分
+        # 例如 buffer_size=1_000_000, num_envs=16 -> per_env_buffer_size=62_500
         self.per_env_buffer_size = buffer_size // num_envs  # 每个环境的缓冲区大小
-        # 注意: 128x128x3 的 RGB 数据, 回放缓冲区大小为 100_000 时约占 4.7GB GPU 内存
-        # 32 个并行环境使用渲染约占 2.2GB GPU 内存
+
+        # ------------------------------------------------------------------
+        # 显存占用提示 (仅作参考, 实际取决于观测分辨率与缓冲区大小):
+        #   - 128x128x3 的 RGB 数据, 回放缓冲区大小为 100_000 时约占 4.7GB GPU 内存
+        #   - 32 个并行环境使用渲染约占 2.2GB GPU 内存
+        # 若显存不足, 可将 storage_device 设为 'cpu', 以时间换空间.
+        # ------------------------------------------------------------------
+
+        # 观测存储: 使用 DictArray 以支持嵌套字典观测 (如 rgb / state / depth)
+        # 形状: (per_env_buffer_size, num_envs, *obs_shape)
         self.obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
         # TODO (stao): 优化最终观测存储
+        # 下一时刻观测: 同样使用 DictArray, 与 obs 形状一致
+        # 注意: next_obs 独立存储而非通过 obs[t+1] 推导, 是为了正确处理
+        #       回合边界 (done) 时 next_obs 来自 final_observation 的特殊情况.
         self.next_obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
-        self.actions = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device)
-        self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
 
-    # 添加经验到缓冲区
+        # 动作存储: 普通张量, 形状 (per_env_buffer_size, num_envs, *action_shape)
+        self.actions = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device)
+        # 以下字段在当前 SAC 脚本中未实际使用, 保留以兼容其他算法 (如 PPO) 的缓冲区接口
+        self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)  # 动作对数概率 (PPO 用)
+        self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)  # 奖励
+        self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)  # 终止/截断标志 (实际语义见 add 的 done 参数)
+        self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)  # 价值估计 (PPO 用)
+
+    # ------------------------------------------------------------------------
+    # 添加一条 (跨所有并行环境的) 转移经验到缓冲区
+    #
+    # 参数:
+    #   obs      : 当前观测, 字典形式, 每个键对应的张量形状为 (num_envs, *obs_shape)
+    #   next_obs : 下一时刻观测, 字典形式, 形状同 obs
+    #   action   : 执行的动作, 张量, 形状 (num_envs, *action_shape)
+    #   reward   : 获得的奖励, 张量, 形状 (num_envs,)
+    #   done     : 是否停止 bootstrap 的标志, 张量, 形状 (num_envs,).
+    #              注意: 此处 done 的语义为 "stop_bootstrap", 而非简单的终止信号.
+    #              其具体含义由调用方根据 args.bootstrap_at_done 配置决定:
+    #                - 'always' : 永不停止 bootstrap (全 False)
+    #                - 'never'  : 终止或截断都停止 (terminations | truncations)
+    #                - 其他     : 仅终止时停止, 截断时继续 bootstrap
+    # ------------------------------------------------------------------------
     def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
-        # 如果存储设备是 CPU, 将数据移到 CPU
+        # 设备迁移: 若存储设备为 CPU, 需将可能位于 GPU 的输入数据迁移到 CPU
+        # 这样可以释放 GPU 显存, 代价是增加一次跨设备拷贝开销
         if self.storage_device == torch.device("cpu"):
             obs = {k: v.cpu() for k, v in obs.items()}
             next_obs = {k: v.cpu() for k, v in next_obs.items()}
@@ -251,31 +314,60 @@ class ReplayBuffer:
             reward = reward.cpu()
             done = done.cpu()
 
+        # 将当前时间步的所有并行环境数据写入缓冲区的 self.pos 位置
         self.obs[self.pos] = obs
         self.next_obs[self.pos] = next_obs
 
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
         self.dones[self.pos] = done
+        # 注意: logprobs / values 在本 SAC 脚本中未写入, 保持为 0
 
+        # 写入指针后移一位 (沿时间步维度前进)
         self.pos += 1
-        # 如果到达缓冲区末尾, 重新开始
+        # 环形缓冲区: 若已写满, 标记 full 并回绕到起始位置, 后续写入将覆盖最旧数据
         if self.pos == self.per_env_buffer_size:
             self.full = True
             self.pos = 0
-    
-    # 从缓冲区采样一个批次
+
+    # ------------------------------------------------------------------------
+    # 从缓冲区中随机均匀采样一个小批量的转移数据
+    #
+    # 采样策略:
+    #   - 时间维度: 若缓冲区已满 (self.full), 从 [0, per_env_buffer_size) 均匀采样;
+    #               否则仅从已写入区域 [0, self.pos) 采样, 避免取到未初始化的零值.
+    #   - 环境维度: 从 [0, num_envs) 均匀采样, 与时间维度独立.
+    #   - 两个维度独立采样构成 (batch_size,) 个 (time_idx, env_idx) 索引对,
+    #     相当于在所有已存储的 (时间步, 环境) 二维网格上做均匀随机抽样.
+    #
+    # 参数:
+    #   batch_size : 采样批次大小, 即返回的样本数量
+    #
+    # 返回:
+    #   ReplayBufferSample : 包含 obs / next_obs / actions / rewards / dones
+    #                        的数据结构, 所有张量已迁移到 sample_device.
+    # ------------------------------------------------------------------------
     def sample(self, batch_size: int):
+        # 1. 生成时间步索引: 根据缓冲区是否写满选择采样范围
         if self.full:
+            # 已写满: 从整个时间维度 [0, per_env_buffer_size) 采样
             batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
         else:
+            # 未写满: 仅从已写入区域 [0, self.pos) 采样, 避免取到占位零值
             batch_inds = torch.randint(0, self.pos, size=(batch_size, ))
+        # 2. 生成环境索引: 从所有并行环境 [0, num_envs) 采样
         env_inds = torch.randint(0, self.num_envs, size=(batch_size, ))
+
+        # 3. 使用二维索引 (batch_inds, env_inds) 从缓冲区取数据
+        #    对于 DictArray, 返回值为字典; 对于普通张量, 返回值为张量
         obs_sample = self.obs[batch_inds, env_inds]
         next_obs_sample = self.next_obs[batch_inds, env_inds]
-        # 将采样数据移到采样设备
+
+        # 4. 将采样数据从存储设备迁移到采样设备 (通常为 GPU), 供模型前向计算使用
         obs_sample = {k: v.to(self.sample_device) for k, v in obs_sample.items()}
         next_obs_sample = {k: v.to(self.sample_device) for k, v in next_obs_sample.items()}
+
+        # 5. 打包为 ReplayBufferSample 返回 (动作/奖励/dones 同样迁移到采样设备)
         return ReplayBufferSample(
             obs=obs_sample,
             next_obs=next_obs_sample,
@@ -284,7 +376,6 @@ class ReplayBuffer:
             dones=self.dones[batch_inds, env_inds].to(self.sample_device)
         )
 
-# 算法逻辑: 在此初始化智能体
 # 平面卷积网络, 用于从图像中提取特征
 class PlainConv(nn.Module):
     def __init__(self,
@@ -296,30 +387,79 @@ class PlainConv(nn.Module):
                  ):
         super().__init__()
         # 假设输入图像尺寸为 128x128 或 64x64
-
         self.out_dim = out_dim
-        # CNN 结构: 逐步下采样提取特征
+        # CNN特征提取主干网络: 逐步下采样提取特征
+        # ----------------------------------------------------------------
+        # 设计思路: 通过 4 个 "Conv2d + MaxPool2d" 下采样块逐步提取视觉特征,
+        # 最后接一个 1x1 卷积进行通道维度的特征融合.
+        # 输入图像尺寸支持 128x128 或 64x64, 经网络后均下采样至 4x4 的特征图.
+        #
+        # 通道数变化: in_channels -> 16 -> 32 -> 64 -> 64 -> 64
+        # 空间尺寸变化 (128x128 输入): 128 -> 32 -> 16 -> 8 -> 4 -> 4
+        # 空间尺寸变化 (64x64   输入):  64 -> 32 -> 16 -> 8 -> 4 -> 4
+        #
+        # 最终输出: (B, 64, 4, 4) 的特征图, 后续展平为 (B, 1024) 送入 FC 层
+        # ----------------------------------------------------------------
         self.cnn = nn.Sequential(
+            # ---- 第 1 个卷积块: 浅层特征提取 (边缘、颜色、纹理等) ----
+            # Conv2d: 3x3 卷积核, padding=1 保持空间尺寸不变, stride=1 (默认)
+            # in_channels -> 16: 将输入图像 (RGB/RGBD) 映射到 16 维特征空间
+            # ReLU(inplace=True): 原地操作节省显存, 引入非线性
             nn.Conv2d(in_channels, 16, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(4, 4) if image_size[0] == 128 and image_size[1] == 128 else nn.MaxPool2d(2, 2),  # [32, 32]
+            # MaxPool2d: 自适应下采样, 统一不同输入尺寸到 32x32
+            #   - 128x128 输入: 4x4 池化核 stride=4, 输出 128/4 = 32x32
+            #   - 64x64   输入: 2x2 池化核 stride=2, 输出  64/2 = 32x32
+            # MaxPool 选取局部最大值, 提供平移不变性并减少计算量
+            nn.MaxPool2d(4, 4) if image_size[0] == 128 and image_size[1] == 128 else nn.MaxPool2d(2, 2),  # 图像尺寸: [32, 32]
+
+            # ---- 第 2 个卷积块: 中层特征提取 (局部形状、部件组合等) ----
+            # 16 -> 32: 加倍通道数以提取更丰富的特征, 3x3 卷积 + padding=1 保持尺寸
             nn.Conv2d(16, 32, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [16, 16]
+            # 2x2 最大池化: 空间尺寸减半, 32x32 -> 16x16
+            nn.MaxPool2d(2, 2),  # 图像尺寸: [16, 16]
+
+            # ---- 第 3 个卷积块: 高层特征提取 (物体部件、空间关系等) ----
+            # 32 -> 64: 继续加倍通道数, 3x3 卷积 + padding=1 保持尺寸
             nn.Conv2d(32, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [8, 8]
+            # 2x2 最大池化: 空间尺寸减半, 16x16 -> 8x8
+            nn.MaxPool2d(2, 2),  # 图像尺寸: [8, 8]
+
+            # ---- 第 4 个卷积块: 高层语义特征提取 ----
+            # 64 -> 64: 保持通道数不变, 进一步精炼特征表示
             nn.Conv2d(64, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [4, 4]
+            # 2x2 最大池化: 空间尺寸减半, 8x8 -> 4x4
+            nn.MaxPool2d(2, 2),  # 图像尺寸: [4, 4]
+
+            # ---- 第 5 个卷积层: 1x1 卷积, 通道维度特征融合 ----
+            # 1x1 卷积不改变空间尺寸, 仅在通道维度上做线性组合
+            # 作用: 跨通道信息整合, 类似于在每个像素位置施加一个共享 MLP
+            # 输出: (B, 64, 4, 4) — 64 个 4x4 的特征图
             nn.Conv2d(64, 64, 1, padding=0, bias=True), nn.ReLU(inplace=True),
         )
 
         # 根据是否池化特征图选择不同的输出方式
         if pool_feature_map:
-            self.pool = nn.AdaptiveMaxPool2d((1, 1))
+            self.pool = nn.AdaptiveMaxPool2d((1, 1)) # 自适应池化到 1x1, 输出 (B, 64, 1, 1)
             self.fc = make_mlp(128, [out_dim], last_act=last_act)
         else:
-            self.pool = None
+            self.pool = None # 不池化, 输出 (B, 64, 4, 4)
             self.fc = make_mlp(64 * 4 * 4, [out_dim], last_act=last_act)
-
+            
+        # 重置参数
         self.reset_parameters()
+        
+        # 打印 PlainConv 结构与维度信息
+        print(f"[PlainConv] 模型结构与维度信息:")
+        print(f"  - in_channels (输入通道数): {in_channels}")
+        print(f"  - out_dim (输出特征维度): {out_dim}")
+        print(f"  - image_size (输入图像尺寸): {image_size}")
+        print(f"  - pool_feature_map: {pool_feature_map}")
+        print(f"  - last_act: {last_act}")
+        print(f"  - CNN 网络结构:\n{self.cnn}")
+        if self.pool is not None:
+            print(f"  - pool: {self.pool}")
+        print(f"  - FC 网络结构:\n{self.fc}")
+        print(f"  - 总参数量: {sum(p.numel() for p in self.parameters())}")
 
     # 重置参数
     def reset_parameters(self):
@@ -329,11 +469,24 @@ class PlainConv(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, image):
-        x = self.cnn(image)
+        # 打印前向传播中各阶段特征图维度 (仅第一次)
+        if not getattr(self, "_printed_fwd_dims", False):
+            print(f"[PlainConv.forward] 特征图维度变化 (仅打印一次):")
+            print(f"  - input image.shape: {image.shape} (B, C, H, W)")
+        x = self.cnn(image) # CNN 特征提取
+        if not getattr(self, "_printed_fwd_dims", False):
+            print(f"  - after cnn.shape: {x.shape} (B, 64, 4, 4)")
         if self.pool is not None:
-            x = self.pool(x)
-        x = x.flatten(1)
-        x = self.fc(x)
+            x = self.pool(x) # 特征图池化
+            if not getattr(self, "_printed_fwd_dims", False):
+                print(f"  - after pool.shape: {x.shape} (B, 64, 1, 1)")
+        x = x.flatten(1) # 展平为 (B, 64*4*4) 或 (B, 64*1*1)
+        if not getattr(self, "_printed_fwd_dims", False):
+            print(f"  - after flatten.shape: {x.shape} (B, {x.shape[1]})")
+        x = self.fc(x) # 全连接层映射到最终输出维度
+        if not getattr(self, "_printed_fwd_dims", False):
+            print(f"  - output.shape: {x.shape} (B, {self.out_dim})")
+            self._printed_fwd_dims = True
         return x
 
 # class Encoder(nn.Module):
@@ -398,20 +551,22 @@ class EncoderObsWrapper(nn.Module):
         # 处理 RGB 观测
         if "rgb" in obs:
             rgb = obs['rgb'].float() / 255.0 # (B, H, W, 3*k)
-        # 处理深度观测
+        # 处理 Depth 观测
         if "depth" in obs:
             depth = obs['depth'].float() # (B, H, W, 1*k)
+            
         # 合并 RGB 和深度信息
-        if "rgb" and "depth" in obs:
-            img = torch.cat([rgb, depth], dim=3) # (B, H, W, C)
+        if "rgb" in obs and "depth" in obs:
+            img = torch.cat([rgb, depth], dim=3) # (B, H, W, C), dim=3表示在图像通道维度上拼接
         elif "rgb" in obs:
             img = rgb
         elif "depth" in obs:
             img = depth
         else:
             raise ValueError(f"Observation dict must contain 'rgb' or 'depth'")
-        # 转换为 PyTorch 需要的格式 (B, C, H, W)
-        img = img.permute(0, 3, 1, 2) # (B, C, H, W)
+        
+        # 重排维度, 转换为 PyTorch 需要的格式 (B, C, H, W)
+        img = img.permute(0, 3, 1, 2) # (B, H, W, C) -> (B, C, H, W)
         return self.encoder(img)
 
 # 创建多层感知机 (MLP)
@@ -422,8 +577,7 @@ class EncoderObsWrapper(nn.Module):
 # 参数:
 #   in_channels  (int)               : 输入特征维度 (第一层 Linear 的 in_features).
 #   mlp_channels (list[int])         : 各层输出维度列表, 列表长度即为 MLP 的层数.
-#   act_builder  (callable, 可选)    : 激活函数构造器, 默认为 nn.ReLU.
-#                                       传入构造器 (而非实例) 以便每层创建独立的激活函数模块.
+#   act_builder  (callable, 可选)    : 激活函数构造器, 默认为 nn.ReLU, 传入构造器 (而非实例) 以便每层创建独立的激活函数模块.
 #   last_act     (bool, 可选)        : 是否在最后一层 Linear 之后也添加激活函数.
 #                                       - True : 每层 Linear 后都接激活函数 (适用于特征提取/编码器主体).
 #                                       - False: 最后一层 Linear 不接激活函数 (适用于输出 Q 值等回归任务).
@@ -447,24 +601,26 @@ def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
     return nn.Sequential(*module_list)
 
 # Soft Q 网络 (用于估计状态-动作对的价值)
-# Q(s, a) 近似软 Bellman 方程中的 Q 值函数:
-# Q(s, a) ≈ r + γ * E_{s'~p, a'~π}[Q(s', a') - α * log π(a'|s')]
+# Q(s, a) 近似软 Bellman 方程中的 Q 值函数: Q(s, a) ≈ r + γ * E_{s'~p, a'~π}[Q(s', a') - α * log π(a'|s')]
 class SoftQNetwork(nn.Module):
     def __init__(self, envs, encoder: EncoderObsWrapper):
         super().__init__()
-        self.encoder = encoder
-        action_dim = np.prod(envs.single_action_space.shape)
-        state_dim = envs.single_observation_space['state'].shape[0]
-        # 打印维度信息
-        print(f"[SoftQNetwork] 维度信息:")
+        self.encoder = encoder # 视觉编码器, 用于提取视觉特征
+        action_dim = np.prod(envs.single_action_space.shape) # 动作空间维度, np.prod()函数计算数组中所有元素的乘积
+        state_dim = envs.single_observation_space['state'].shape[0] # 状态空间维度
+        # Soft Q 网络(self.mlp)结构: 视觉特征(self.encoder) + 状态 + 动作 -> 512 -> 256 -> 1 (Q值)
+        self.mlp = make_mlp(encoder.encoder.out_dim + action_dim + state_dim, [512, 256, 1], last_act=False)
+        # 打印 SoftQNetwork 结构与维度信息
+        print(f"[SoftQNetwork] 模型结构与维度信息:")
         print(f"  - 视觉特征维度 (encoder.out_dim): {encoder.encoder.out_dim}")
         print(f"  - 动作维度 (action_dim): {action_dim}")
         print(f"  - 状态维度 (state_dim): {state_dim}")
         print(f"  - 输入总维度 (visual + state + action): {encoder.encoder.out_dim + action_dim + state_dim}")
         print(f"  - MLP 隐藏层维度: [512, 256, 1]")
-        # 网络结构: 视觉特征 + 状态 + 动作 -> 512 -> 256 -> 1 (Q值)
-        self.mlp = make_mlp(encoder.encoder.out_dim + action_dim + state_dim, [512, 256, 1], last_act=False)
-
+        print(f"  - MLP 网络结构:\n{self.mlp}")
+        print(f"  - MLP 参数量: {sum(p.numel() for p in self.mlp.parameters())}")
+        
+    # 前向传播: 视觉特征(观测) + 状态 + 动作 -> Q 值
     def forward(self, obs, action, visual_feature=None, detach_encoder=False):
         # 如果没有提供视觉特征, 使用编码器提取
         if visual_feature is None:
@@ -474,6 +630,17 @@ class SoftQNetwork(nn.Module):
             visual_feature = visual_feature.detach()
         # 拼接视觉特征、状态和动作
         x = torch.cat([visual_feature, obs["state"], action], dim=1)
+        # 打印前向传播维度 (仅第一次)
+        if not getattr(self, "_printed_fwd_dims", False):
+            print(f"[SoftQNetwork.forward] 维度信息 (仅打印一次):")
+            print(f"  - visual_feature.shape: {visual_feature.shape}")
+            print(f"  - obs['state'].shape: {obs['state'].shape}")
+            print(f"  - action.shape: {action.shape}")
+            print(f"  - 拼接后 x.shape: {x.shape}")
+            out = self.mlp(x)
+            print(f"  - Q 值输出 out.shape: {out.shape}")
+            self._printed_fwd_dims = True
+            return out
         return self.mlp(x)
 
 
@@ -512,12 +679,38 @@ class Actor(nn.Module):
         self.action_scale = torch.FloatTensor((envs.single_action_space.high - envs.single_action_space.low) / 2.0)
         self.action_bias = torch.FloatTensor((envs.single_action_space.high + envs.single_action_space.low) / 2.0)
 
+        # 打印 Actor 结构与维度信息
+        print(f"[Actor] 模型结构与维度信息:")
+        print(f"  - action_dim (动作维度): {action_dim}")
+        print(f"  - state_dim (状态维度): {state_dim}")
+        print(f"  - in_channels (输入通道数): {in_channels}")
+        print(f"  - image_size (图像尺寸): {image_size}")
+        print(f"  - encoder.out_dim (视觉特征维度): {self.encoder.encoder.out_dim}")
+        print(f"  - MLP 输入维度 (visual + state): {self.encoder.encoder.out_dim + state_dim}")
+        print(f"  - MLP 隐藏层维度: [512, 256]")
+        print(f"  - MLP 网络结构:\n{self.mlp}")
+        print(f"  - fc_mean: {self.fc_mean}")
+        print(f"  - fc_logstd: {self.fc_logstd}")
+        print(f"  - action_scale.shape: {self.action_scale.shape}")
+        print(f"  - action_bias.shape: {self.action_bias.shape}")
+        print(f"  - 总参数量: {sum(p.numel() for p in self.parameters())}")
+
     # 获取特征
     def get_feature(self, obs, detach_encoder=False):
         visual_feature = self.encoder(obs)
         if detach_encoder:
             visual_feature = visual_feature.detach()
         x = torch.cat([visual_feature, obs['state']], dim=1)
+        # 打印前向传播维度 (仅第一次)
+        if not getattr(self, "_printed_feature_dims", False):
+            print(f"[Actor.get_feature] 维度信息 (仅打印一次):")
+            print(f"  - visual_feature.shape: {visual_feature.shape}")
+            print(f"  - obs['state'].shape: {obs['state'].shape}")
+            print(f"  - 拼接后 x.shape: {x.shape}")
+            mlp_out = self.mlp(x)
+            print(f"  - MLP 输出 shape: {mlp_out.shape}")
+            self._printed_feature_dims = True
+            return mlp_out, visual_feature
         return self.mlp(x), visual_feature
 
     def forward(self, obs, detach_encoder=False):
@@ -636,6 +829,16 @@ if __name__ == "__main__":
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    # 打印环境观测/动作空间信息
+    print(f"[Env] 环境空间信息:")
+    print(f"  - env_id: {args.env_id}")
+    print(f"  - num_envs (训练): {args.num_envs}")
+    print(f"  - num_eval_envs (评估): {args.num_eval_envs}")
+    print(f"  - obs_mode: {args.obs_mode}")
+    print(f"  - single_observation_space: {envs.single_observation_space}")
+    print(f"  - single_action_space: {envs.single_action_space}")
+    print(f"  - action_space.shape: {envs.action_space.shape}")
+
     # 获取最大回合步数
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
@@ -689,23 +892,27 @@ if __name__ == "__main__":
     qf2 = SoftQNetwork(envs, actor.encoder).to(device)  # 第二个软Q网络，用于双重Q学习以减少过拟合
     qf1_target = SoftQNetwork(envs, actor.encoder).to(device)  # 第一个目标软Q网络，用于稳定训练
     qf2_target = SoftQNetwork(envs, actor.encoder).to(device)  # 第二个目标软Q网络，同样用于双重Q学习
+    
     # 如果有检查点, 加载模型
     if args.checkpoint is not None:
-        ckpt = torch.load(args.checkpoint)
-        actor.load_state_dict(ckpt['actor'])
-        qf1.load_state_dict(ckpt['qf1'])
-        qf2.load_state_dict(ckpt['qf2'])
+        ckpt = torch.load(args.checkpoint)   # 加载检查点文件
+        actor.load_state_dict(ckpt['actor']) # 加载actor模型
+        qf1.load_state_dict(ckpt['qf1'])     # 加载第一个Q网络
+        qf2.load_state_dict(ckpt['qf2'])     # 加载第二个Q网络
+        
     # 初始化目标网络
-    qf1_target.load_state_dict(qf1.state_dict())
-    qf2_target.load_state_dict(qf2.state_dict())
+    qf1_target.load_state_dict(qf1.state_dict()) # 将第一个Q网络的状态字典复制到目标网络
+    qf2_target.load_state_dict(qf2.state_dict()) # 将第二个Q网络的状态字典复制到目标网络
+    
     # 初始化优化器 (包含 Q 网络的 MLP 和共享的编码器)
     q_optimizer = optim.Adam(
         list(qf1.mlp.parameters()) +
         list(qf2.mlp.parameters()) +
         list(qf1.encoder.parameters()),
         lr=args.q_lr)
+    # 初始化 actor 优化器
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
-
+    
     # JEPA 辅助模块 (可选): 与 actor.encoder 共享同一个 Encoder 实例, 独立 Predictor 和 Optimizer
     jepa = None # 初始化jepa变量为None
     # 如果参数中指定使用jepa
@@ -757,7 +964,7 @@ if __name__ == "__main__":
 
     # 主训练循环
     while global_step < args.total_timesteps:
-        # 评估逻辑: 定期评估智能体性能
+        # 触发评估的逻辑: 刚完成一轮完整训练, 跨过了评估间隔的整数边界, 需要触发评估
         if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # 切换到评估模式
             actor.eval()
@@ -867,6 +1074,18 @@ if __name__ == "__main__":
             global_update += 1
             # 从回放缓冲区采样一个批次
             data = rb.sample(args.batch_size)
+
+            # 打印第一次采样的批次维度信息
+            if not learning_has_started or global_update == 1:
+                print(f"[ReplayBuffer.sample] 第一次采样批次维度信息 (global_update={global_update}):")
+                print(f"  - batch_size: {args.batch_size}")
+                for k, v in data.obs.items():
+                    print(f"  - data.obs['{k}'].shape: {v.shape}")
+                for k, v in data.next_obs.items():
+                    print(f"  - data.next_obs['{k}'].shape: {v.shape}")
+                print(f"  - data.actions.shape: {data.actions.shape}")
+                print(f"  - data.rewards.shape: {data.rewards.shape}")
+                print(f"  - data.dones.shape: {data.dones.shape}")
 
             # 更新价值网络 (Q 网络)
             # 软 Bellman 目标值:
