@@ -376,7 +376,7 @@ class ReplayBuffer:
             dones=self.dones[batch_inds, env_inds].to(self.sample_device)
         )
 
-# 平面卷积网络, 用于从图像中提取特征
+# 朴素卷积网络, 用于从图像中提取特征
 class PlainConv(nn.Module):
     def __init__(self,
                  in_channels=3,
@@ -655,8 +655,8 @@ LOG_STD_MIN = -5
 class Actor(nn.Module):
     def __init__(self, envs, sample_obs):
         super().__init__()
-        action_dim = np.prod(envs.single_action_space.shape)
-        state_dim = envs.single_observation_space['state'].shape[0]
+        action_dim = np.prod(envs.single_action_space.shape) # 动作空间维度, np.prod()函数计算数组中所有元素的乘积
+        state_dim = envs.single_observation_space['state'].shape[0] # 状态空间维度
         # 计算通道数和图像尺寸
         in_channels = 0
         if "rgb" in sample_obs:
@@ -670,11 +670,11 @@ class Actor(nn.Module):
         self.encoder = EncoderObsWrapper(
             PlainConv(in_channels=in_channels, out_dim=256, image_size=image_size) # 假设图像是 64x64
         )
-        # MLP: 视觉特征 + 状态 -> 512 -> 256
-        self.mlp = make_mlp(self.encoder.encoder.out_dim+state_dim, [512, 256], last_act=True)
+        # Actor 网络(self.mlp)结构: 视觉特征(self.encoder) + 状态 -> 512 -> 256
+        self.mlp = make_mlp(self.encoder.encoder.out_dim + state_dim, [512, 256], last_act=True)
         # 输出均值和对数标准差
-        self.fc_mean = nn.Linear(256, action_dim)
-        self.fc_logstd = nn.Linear(256, action_dim)
+        self.fc_mean = nn.Linear(256, action_dim)   # MLP的输出维度=256
+        self.fc_logstd = nn.Linear(256, action_dim) # MLP的输出维度=256
         # 动作缩放
         self.action_scale = torch.FloatTensor((envs.single_action_space.high - envs.single_action_space.low) / 2.0)
         self.action_bias = torch.FloatTensor((envs.single_action_space.high + envs.single_action_space.low) / 2.0)
@@ -695,13 +695,41 @@ class Actor(nn.Module):
         print(f"  - action_bias.shape: {self.action_bias.shape}")
         print(f"  - 总参数量: {sum(p.numel() for p in self.parameters())}")
 
-    # 获取特征
+    # ------------------------------------------------------------------------
+    # 获取策略网络的共享特征表示 (Actor 前向传播核心)
+    #
+    # 作用:
+    #   将视觉观测 (RGB/RGBD) 与状态观测 (state) 融合为统一的特征向量,
+    #   供后续 fc_mean / fc_logstd 头部生成动作分布参数 (均值 μ(s) 与对数标准差 log σ(s)).
+    #   该方法是 Actor 网络前向传播的核心, 被 forward / get_action / get_eval_action 复用.
+    #
+    # 数据流:
+    #   1. 视觉特征: obs['rgb'] (或 'depth') -> self.encoder -> visual_feature (B, out_dim)
+    #   2. 状态特征: obs['state'] (B, state_dim)
+    #   3. 拼接: [visual_feature, state] -> x (B, out_dim + state_dim)
+    #   4. MLP 投影: x -> self.mlp -> mlp_out (B, 256)
+    #
+    # 参数:
+    #   obs            : 字典形式观测, 至少包含 'state' 键以及 'rgb'/'depth' 之一.
+    #   detach_encoder : 是否切断编码器梯度回传.
+    #                    - True : 用于策略更新阶段, 防止策略损失梯度流入共享编码器
+    #                            (SAC 中编码器主要由 Q 网络损失更新, 以保持视觉表征稳定).
+    #                    - False: 编码器随策略损失一起更新 (默认).
+    #
+    # 返回:
+    #   mlp_out        : MLP 输出的共享特征, 形状 (B, 256), 用于生成 μ(s) 与 log σ(s).
+    #   visual_feature : 视觉编码器输出, 形状 (B, out_dim). 额外返回以便外部 (如 Q 网络)
+    #                    复用同一份视觉特征, 避免重复前向计算 (SAC 中 Q 网络与 Actor 共享编码器).
+    # ------------------------------------------------------------------------
     def get_feature(self, obs, detach_encoder=False):
+        # 1. 视觉编码: 通过 EncoderObsWrapper 处理 RGB/Depth, 输出 (B, out_dim) 视觉特征
         visual_feature = self.encoder(obs)
+        # 2. 可选: 切断梯度, 防止策略损失更新共享编码器 (SAC 常见做法, 编码器由 Q 损失驱动)
         if detach_encoder:
             visual_feature = visual_feature.detach()
+        # 3. 特征融合: 沿特征维度 (dim=1) 拼接视觉特征与状态向量 -> (B, out_dim + state_dim)
         x = torch.cat([visual_feature, obs['state']], dim=1)
-        # 打印前向传播维度 (仅第一次)
+        # 4. (仅首次) 打印前向传播各阶段维度, 便于调试与核对网络结构
         if not getattr(self, "_printed_feature_dims", False):
             print(f"[Actor.get_feature] 维度信息 (仅打印一次):")
             print(f"  - visual_feature.shape: {visual_feature.shape}")
@@ -711,21 +739,73 @@ class Actor(nn.Module):
             print(f"  - MLP 输出 shape: {mlp_out.shape}")
             self._printed_feature_dims = True
             return mlp_out, visual_feature
+        # 5. MLP 投影到 256 维共享特征空间, 供 fc_mean / fc_logstd 使用
         return self.mlp(x), visual_feature
 
+    # ------------------------------------------------------------------------
+    # 前向传播: 由共享特征生成动作分布参数 (均值 μ(s) 与对数标准差 log σ(s))
+    #
+    # 作用:
+    #   调用 get_feature 获取视觉+状态融合后的共享特征 x, 再分别通过 fc_mean / fc_logstd
+    #   两个线性头输出高斯策略的均值和对数标准差. 为了避免 log_std 数值过大/过小导致
+    #   采样不稳定, 使用 tanh 将其映射到 [LOG_STD_MIN, LOG_STD_MAX] 区间.
+    #
+    # 数据流:
+    #   obs -> get_feature -> x (B, 256)
+    #   x -> fc_mean    -> mean    (B, action_dim)        动作分布均值
+    #   x -> fc_logstd  -> log_std (B, action_dim)        动作分布对数标准差 (未裁剪)
+    #   log_std -> tanh + 线性映射 -> log_std ∈ [LOG_STD_MIN, LOG_STD_MAX]
+    #
+    # 参数:
+    #   obs            : 字典形式观测, 至少包含 'state' 键以及 'rgb'/'depth' 之一.
+    #   detach_encoder : 是否切断编码器梯度回传 (透传给 get_feature).
+    #
+    # 返回:
+    #   mean           : 动作分布均值 μ(s), 形状 (B, action_dim).
+    #   log_std        : 裁剪后的对数标准差 log σ(s), 形状 (B, action_dim).
+    #   visual_feature : 视觉编码器输出, 形状 (B, out_dim). 额外返回以便 Q 网络复用,
+    #                    避免重复前向计算 (SAC 中 Q 网络与 Actor 共享编码器).
+    # ------------------------------------------------------------------------
     def forward(self, obs, detach_encoder=False):
+        # 1. 获取共享特征表示 (视觉 + 状态 -> MLP -> 256 维特征)
         x, visual_feature = self.get_feature(obs, detach_encoder)
+        # 2. 通过线性头输出动作分布均值 μ(s)
         mean = self.fc_mean(x)
+        # 3. 通过线性头输出动作分布对数标准差 log σ(s) (尚未裁剪)
         log_std = self.fc_logstd(x)
-        # 使用 tanh 将 log_std 限制在 [LOG_STD_MIN, LOG_STD_MAX] 范围内
+        # 4. 使用 tanh 将 log_std 限制在 [LOG_STD_MIN, LOG_STD_MAX] 范围内
+        #    该变换来自 SpinUp / Denis Yarats 实现:
+        #      - torch.tanh(log_std) ∈ (-1, 1)
+        #      - 再线性映射到 [LOG_STD_MIN, LOG_STD_MAX]: 0.5*(MAX-MIN)*(tanh+1) + MIN
+        #    相比简单的 torch.clamp, 该映射处处可导, 梯度更平滑, 有利于训练稳定.
         log_std = torch.tanh(log_std)
         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # 来自 SpinUp / Denis Yarats
 
         return mean, log_std, visual_feature
 
+    # ------------------------------------------------------------------------
     # 获取评估动作 (确定性策略)
+    #
+    # 作用:
+    #   在评估/测试阶段使用策略的均值动作 (而非采样动作), 以获得确定性的行为输出.
+    #   由于策略输出的是未缩放的高斯均值, 需先经过 tanh 压缩到 (-1, 1), 再通过
+    #   action_scale / action_bias 线性映射回实际动作空间范围.
+    #
+    # 动作映射公式:
+    #   a = tanh(μ(s)) * action_scale + action_bias
+    #   其中 action_scale = (high - low) / 2, action_bias = (high + low) / 2
+    #   可将 tanh 输出的 (-1, 1) 映射到动作空间 [low, high].
+    #
+    # 参数:
+    #   obs : 字典形式观测, 至少包含 'state' 键以及 'rgb'/'depth' 之一.
+    #
+    # 返回:
+    #   action : 确定性评估动作, 形状 (B, action_dim), 已映射到动作空间范围.
+    # ------------------------------------------------------------------------
     def get_eval_action(self, obs):
-        mean, log_std, _ = self(obs)
+        # 1. 前向传播获取动作分布参数 (仅需 mean, 忽略 log_std 和 visual_feature)
+        mean, _, _ = self(obs)
+        # 2. 对均值施加 tanh 并线性映射到动作空间 [low, high], 得到确定性评估动作
         action = torch.tanh(mean) * self.action_scale + self.action_bias
         return action
 
@@ -736,9 +816,9 @@ class Actor(nn.Module):
     # 对数概率 (考虑 tanh 变换的 Jacobian 修正):
     #   log π(a|s) = log N(u; μ(s), σ(s)) - Σ log(scale * (1 - tanh²(u)) + ε)
     def get_action(self, obs, detach_encoder=False):
-        mean, log_std, visual_feature = self(obs, detach_encoder)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
+        mean, log_std, visual_feature = self(obs, detach_encoder) # 获取动作分布参数
+        std = log_std.exp() # 计算标准差 σ(s) = exp(log σ(s))
+        normal = torch.distributions.Normal(mean, std) # 创建高斯分布 N(μ(s), σ(s))
         # 使用重参数化技巧采样 (mean + std * N(0,1))
         x_t = normal.rsample()
         y_t = torch.tanh(x_t)
@@ -750,21 +830,109 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean, visual_feature
 
-    # 将模型移动到指定设备
+    # ------------------------------------------------------------------------
+    # 将模型移动到指定设备 (重写 nn.Module.to)
+    #
+    # 作用:
+    #   将 Actor 网络的所有张量 (包括网络参数和动作缩放张量) 迁移到目标设备
+    #   (如 'cpu' / 'cuda'), 以便后续在该设备上执行前向计算.
+    #
+    # 为何需要重写:
+    #   self.action_scale 和 self.action_bias 在 __init__ 中通过 torch.FloatTensor
+    #   直接创建, 它们既不是 nn.Parameter (不参与梯度优化), 也没有通过
+    #   register_buffer 注册为模块缓冲区. 因此父类 nn.Module.to(device) 无法
+    #   自动感知并迁移这两个张量, 会导致它们停留在 CPU 上, 而网络参数已迁移到
+    #   GPU, 前向计算时因设备不一致而报错.
+    #
+    #   解决方案: 在调用父类 to() 之前, 先手动将这两个张量迁移到目标设备,
+    #   再通过 super().to(device) 迁移所有已注册的参数 (parameters) 与缓冲区
+    #   (buffers), 确保整个模块的所有张量都位于同一设备.
+    #
+    # 参数:
+    #   device : 目标设备, 可以是 torch.device 对象或字符串 (如 'cuda' / 'cpu').
+    #
+    # 返回:
+    #   self : 返回模块自身 (与 nn.Module.to 的行为一致, 支持链式调用).
+    # ------------------------------------------------------------------------
     def to(self, device):
+        # 1. 手动迁移动作缩放张量 (普通 Tensor, 不被父类 to() 管理)
         self.action_scale = self.action_scale.to(device)
         self.action_bias = self.action_bias.to(device)
+        # 2. 调用父类 to() 迁移所有注册的参数与缓冲区, 并返回 self
         return super().to(device)
 
-# 日志记录器类
+# ============================================================================
+# 日志记录器类 (Logger)
+# ----------------------------------------------------------------------------
+# 作用:
+#   统一封装训练/评估过程中标量指标 (如 loss、return、success_once 等) 的记录逻辑,
+#   对上层屏蔽底层日志后端的具体实现. 当前支持两种后端:
+#     1. TensorBoard (通过 torch.utils.tensorboard.SummaryWriter): 本地可视化,
+#        数据写入 runs/{run_name} 目录, 可用 `tensorboard --logdir runs` 查看.
+#     2. Weights & Biases (wandb, 可选): 云端实验跟踪平台, 便于跨实验对比与协作.
+#
+# 设计要点:
+#   - 双后端兼容: 通过 log_wandb 开关控制是否同时向 wandb 上报数据. 无论是否启用
+#     wandb, 始终会向 TensorBoard 写入, 保证本地始终留存完整日志.
+#   - 轻量包装: 该类不缓存/聚合数据, 仅做透传, 实际的步数对齐与时间戳由调用方
+#     (主训练循环) 通过 step 参数显式传入, 保证不同指标的时间轴一致.
+#   - 生命周期管理: 提供 close() 方法在训练结束时关闭 TensorBoard writer,
+#     确保缓冲数据落盘; 注意 wandb 的退出由 wandb.finish() 单独管理 (本脚本未调用).
+# ============================================================================
 class Logger:
+    # ------------------------------------------------------------------------
+    # 构造函数: 初始化日志后端
+    #
+    # 参数:
+    #   log_wandb   (bool, 可选)        : 是否同时向 Weights & Biases 上报数据.
+    #                                     - True : add_scalar 时额外调用 wandb.log;
+    #                                     - False: 仅写入 TensorBoard.
+    #                                     注意: 启用前需在外部已完成 wandb.init(),
+    #                                     否则调用 add_scalar 会因 wandb 未初始化而报错.
+    #   tensorboard (SummaryWriter, 可选): 已创建的 TensorBoard SummaryWriter 实例,
+    #                                     用于本地标量/文本数据的写入. 若为 None 则
+    #                                     add_scalar / close 将因 writer 为 None 而失败,
+    #                                     因此调用方应确保在训练模式下传入有效 writer.
+    # ------------------------------------------------------------------------
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
-        self.writer = tensorboard
-        self.log_wandb = log_wandb
+        self.writer = tensorboard   # TensorBoard 写入器 (本地日志后端)
+        self.log_wandb = log_wandb  # 是否同时启用 wandb (云端日志后端)
+
+    # ------------------------------------------------------------------------
+    # 记录一个标量指标
+    #
+    # 作用:
+    #   将单个标量值 (如损失、奖励、成功率等) 同时写入启用的日志后端.
+    #   - 若 log_wandb 为 True, 先调用 wandb.log 上报到云端, step 用于对齐时间轴;
+    #   - 无论 log_wandb 取值, 始终调用 self.writer.add_scalar 写入 TensorBoard.
+    #
+    # 参数:
+    #   tag          (str)   : 指标名称, 通常使用 "/" 分层 (如 "losses/qf1_loss",
+    #                          "eval/return"), TensorBoard 会据此自动分组展示.
+    #   scalar_value (float) : 指标数值, 可为 Python 标量或 0 维张量.
+    #   step         (int)   : 对应的全局步数 (一般为 global_step), 用于确定曲线的 x 轴.
+    #                          不同指标共用同一 step 以保证时间轴对齐.
+    # ------------------------------------------------------------------------
     def add_scalar(self, tag, scalar_value, step):
+        # 1. (可选) 上报到 Weights & Biases 云端
         if self.log_wandb:
             wandb.log({tag: scalar_value}, step=step)
+        # 2. 始终写入本地 TensorBoard
         self.writer.add_scalar(tag, scalar_value, step)
+
+    # ------------------------------------------------------------------------
+    # 关闭日志记录器
+    #
+    # 作用:
+    #   关闭内部的 TensorBoard SummaryWriter, 刷新并释放底层文件资源,
+    #   确保所有缓冲的标量数据已落盘到 runs/{run_name} 目录.
+    #   通常在训练结束 (或异常退出前) 调用一次.
+    #
+    # 注意:
+    #   - 本方法仅关闭 TensorBoard writer, 不会调用 wandb.finish();
+    #     wandb 的资源释放需由调用方另行处理.
+    #   - 重复调用 close() 可能因 writer 已关闭而抛出异常, 应避免.
+    # ------------------------------------------------------------------------
     def close(self):
         self.writer.close()
 
@@ -781,6 +949,70 @@ if __name__ == "__main__":
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
+        
+    # 打印输入的和计算得到的关键参数值
+    print("=" * 80)
+    print("[参数配置] 输入的和计算得到的关键参数值:")
+    print("=" * 80)
+    # --- 实验相关参数 ---
+    print("【实验相关参数】")
+    print(f"  - exp_name: {args.exp_name}")
+    print(f"  - run_name: {run_name}")
+    print(f"  - seed: {args.seed}")
+    print(f"  - torch_deterministic: {args.torch_deterministic}")
+    print(f"  - cuda: {args.cuda}")
+    print(f"  - track (wandb): {args.track}")
+    print(f"  - capture_video: {args.capture_video}")
+    print(f"  - save_trajectory: {args.save_trajectory}")
+    print(f"  - save_model: {args.save_model}")
+    print(f"  - evaluate: {args.evaluate}")
+    print(f"  - checkpoint: {args.checkpoint}")
+    print(f"  - log_freq: {args.log_freq}")
+    # --- 环境特定参数 ---
+    print("【环境特定参数】")
+    print(f"  - env_id: {args.env_id}")
+    print(f"  - obs_mode: {args.obs_mode}")
+    print(f"  - include_state: {args.include_state}")
+    print(f"  - env_vectorization: {args.env_vectorization}")
+    print(f"  - num_envs (训练): {args.num_envs}")
+    print(f"  - num_eval_envs (评估): {args.num_eval_envs}")
+    print(f"  - num_steps: {args.num_steps}")
+    print(f"  - num_eval_steps: {args.num_eval_steps}")
+    print(f"  - eval_freq: {args.eval_freq}")
+    print(f"  - control_mode: {args.control_mode}")
+    print(f"  - render_mode: {args.render_mode}")
+    print(f"  - camera_width: {args.camera_width}")
+    print(f"  - camera_height: {args.camera_height}")
+    # --- 算法特定参数 ---
+    print("【算法特定参数】")
+    print(f"  - total_timesteps: {args.total_timesteps}")
+    print(f"  - buffer_size: {args.buffer_size}")
+    print(f"  - buffer_device: {args.buffer_device}")
+    print(f"  - gamma: {args.gamma}")
+    print(f"  - tau: {args.tau}")
+    print(f"  - batch_size: {args.batch_size}")
+    print(f"  - learning_starts: {args.learning_starts}")
+    print(f"  - policy_lr: {args.policy_lr}")
+    print(f"  - q_lr: {args.q_lr}")
+    print(f"  - policy_frequency: {args.policy_frequency}")
+    print(f"  - target_network_frequency: {args.target_network_frequency}")
+    print(f"  - alpha: {args.alpha}")
+    print(f"  - autotune: {args.autotune}")
+    print(f"  - training_freq: {args.training_freq}")
+    print(f"  - utd: {args.utd}")
+    print(f"  - bootstrap_at_done: {args.bootstrap_at_done}")
+    # --- JEPA 辅助模块参数 ---
+    print("【JEPA 辅助模块参数】")
+    print(f"  - use_jepa: {args.use_jepa}")
+    print(f"  - jepa_lr: {args.jepa_lr}")
+    print(f"  - jepa_hidden_dims: {args.jepa_hidden_dims}")
+    print(f"  - jepa_update_encoder: {args.jepa_update_encoder}")
+    # --- 计算得到的运行时参数 ---
+    print("【计算得到的运行时参数】")
+    print(f"  - grad_steps_per_iteration = training_freq * utd = {args.training_freq} * {args.utd} = {args.grad_steps_per_iteration}")
+    print(f"  - steps_per_env = training_freq // num_envs = {args.training_freq} // {args.num_envs} = {args.steps_per_env}")
+    print(f"  - global_steps_per_iteration = num_envs * steps_per_env = {args.num_envs} * {args.steps_per_env} = {args.num_envs * args.steps_per_env}")
+    print("=" * 80)
 
     # 设置随机种子
     random.seed(args.seed)
@@ -831,14 +1063,10 @@ if __name__ == "__main__":
 
     # 打印环境观测/动作空间信息
     print(f"[Env] 环境空间信息:")
-    print(f"  - env_id: {args.env_id}")
-    print(f"  - num_envs (训练): {args.num_envs}")
-    print(f"  - num_eval_envs (评估): {args.num_eval_envs}")
-    print(f"  - obs_mode: {args.obs_mode}")
     print(f"  - single_observation_space: {envs.single_observation_space}")
     print(f"  - single_action_space: {envs.single_action_space}")
     print(f"  - action_space.shape: {envs.action_space.shape}")
-
+    
     # 获取最大回合步数
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
@@ -887,7 +1115,7 @@ if __name__ == "__main__":
     eval_obs, _ = eval_envs.reset(seed=args.seed)
 
     # 架构说明: 所有 actor 和 q-network 共享相同的视觉编码器. 编码器的输出与任何状态数据拼接, 后面跟随单独的 MLPs
-    actor = Actor(envs, sample_obs=obs).to(device)
+    actor = Actor(envs, sample_obs=obs).to(device) # 创建 Actor 网络, 共享视觉编码器
     qf1 = SoftQNetwork(envs, actor.encoder).to(device)  # 第一个软Q网络
     qf2 = SoftQNetwork(envs, actor.encoder).to(device)  # 第二个软Q网络，用于双重Q学习以减少过拟合
     qf1_target = SoftQNetwork(envs, actor.encoder).to(device)  # 第一个目标软Q网络，用于稳定训练
@@ -942,7 +1170,7 @@ if __name__ == "__main__":
             device=device,
         )
 
-    # 自动熵调整
+    # 自动熵调整(可选)
     # 目标熵: H_target = -|A| (动作维度的负数)
     # 熵系数 α 通过以下损失自动调整:
     #   J(α) = E[-α * (log π(a|s) + H_target)]
@@ -954,13 +1182,13 @@ if __name__ == "__main__":
     else:
         alpha = args.alpha
 
-    global_step = 0
-    global_update = 0
-    learning_has_started = False
+    global_step = 0  # 全局环境交互步数计数器 (所有并行环境合计), 用于控制训练进度与日志 x 轴
+    global_update = 0  # 全局梯度更新次数计数器, 用于控制策略/目标网络的更新频率
+    learning_has_started = False  # 标记是否已过 learning_starts 阶段 (区分随机探索与策略采样)
 
-    global_steps_per_iteration = args.num_envs * (args.steps_per_env)
-    pbar = tqdm.tqdm(range(args.total_timesteps))
-    cumulative_times = defaultdict(float)
+    global_steps_per_iteration = args.num_envs * (args.steps_per_env)  # 每次迭代收集的总环境步数, 用于计算 rollout FPS 等指标
+    pbar = tqdm.tqdm(range(args.total_timesteps))  # 创建训练进度条, 可视化总步数推进情况
+    cumulative_times = defaultdict(float)  # 累计各阶段 (rollout/update/eval) 耗时的字典, 用于统计时间开销
 
     # 主训练循环
     while global_step < args.total_timesteps:
@@ -999,10 +1227,11 @@ if __name__ == "__main__":
                 eval_time = time.perf_counter() - stime
                 cumulative_times["eval_time"] += eval_time
                 logger.add_scalar("time/eval_time", eval_time, global_step)
-            # 如果是评估模式, 退出循环
+                
+            # 如果是评估模式, 则退出循环
             if args.evaluate:
                 break
-            # 切换回训练模式
+            # 否则, 切换回训练模式
             actor.train()
 
             # 保存模型检查点
