@@ -128,8 +128,6 @@ class Args:
     """训练频率 (步数)"""
     utd: float = 0.25
     """更新与数据的比率"""
-    partial_reset: bool = False
-    """是否让并行环境在终止时重置而不是截断时重置"""
     bootstrap_at_done: str = "always"
     """收到 done 信号时使用的 bootstrap 方法. 可以是 'always' 或 'never'"""
     camera_width: Optional[int] = None
