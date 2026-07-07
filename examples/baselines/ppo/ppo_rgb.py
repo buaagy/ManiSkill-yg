@@ -25,6 +25,12 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, Flatten
 from mani_skill.utils.wrappers.record import RecordEpisode  # 记录episode包装器
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv  # ManiSkill向量化环境
 
+# 复用 sac_moe 文件夹中已创建的 jepa.py 辅助模块
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "experimental" / "sac_moe"))
+from jepa import JEPA, JEPAConfig
+
 @dataclass
 class Args:
     # 实验配置参数
@@ -113,6 +119,16 @@ class Args:
     save_train_video_freq: Optional[int] = None  # 训练视频保存频率
     """frequency to save training videos in terms of iterations"""
     finite_horizon_gae: bool = False  # 是否使用有限视界GAE
+
+    # JEPA 辅助模块参数
+    use_jepa: bool = False
+    """如果启用, 在训练期间开启动作条件的 JEPA 辅助损失模块."""
+    jepa_lr: float = 3e-4
+    """JEPA predictor 优化器的学习率."""
+    jepa_hidden_dims: str = "256,256"
+    """JEPA predictor MLP 的隐藏层维度 (逗号分隔)."""
+    jepa_update_encoder: bool = False
+    """如果启用, JEPA 优化器也会更新共享 encoder. 默认 False (encoder 仅由 PPO 更新)."""
 
 
     # 运行时计算的参数
@@ -519,6 +535,9 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
+    # JEPA 辅助模块需要 next_obs, 用于构造 (obs_t, action_t, obs_{t+1}) 转移样本
+    next_obs_buffer = DictArray((args.num_steps, args.num_envs), envs.single_observation_space, device=device) if args.use_jepa else None
+
     # 开始训练
     global_step = 0
     start_time = time.time()
@@ -536,6 +555,23 @@ if __name__ == "__main__":
     # 加载预训练检查点(如果指定)
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
+
+    # JEPA 辅助模块 (可选): 与 agent.feature_net 共享同一个编码器实例, 独立 Predictor 和 Optimizer
+    jepa = None
+    if args.use_jepa:
+        jepa_hidden_dims = tuple(int(x) for x in args.jepa_hidden_dims.split(",") if x.strip() != "")
+        jepa_config = JEPAConfig(
+            latent_dim=agent.feature_net.out_features,
+            hidden_dims=jepa_hidden_dims,
+            lr=args.jepa_lr,
+            update_encoder=args.jepa_update_encoder,
+        )
+        jepa = JEPA(
+            encoder=agent.feature_net,
+            action_dim=int(np.prod(envs.single_action_space.shape)),
+            config=jepa_config,
+            device=device,
+        )
 
     # 累计时间统计
     cumulative_times = defaultdict(float)
@@ -605,6 +641,10 @@ if __name__ == "__main__":
             next_done = torch.logical_or(terminations, truncations).to(torch.float32)
             rewards[step] = reward.view(-1) * args.reward_scale
 
+            # 存储 next_obs 供 JEPA 辅助模块使用
+            if next_obs_buffer is not None:
+                next_obs_buffer[step] = next_obs
+
             # 处理episode结束时的信息
             if "final_info" in infos:
                 final_info = infos["final_info"]
@@ -667,6 +707,7 @@ if __name__ == "__main__":
 
         # 扁平化批次数据
         b_obs = obs.reshape((-1,))
+        b_next_obs = next_obs_buffer.reshape((-1,)) if next_obs_buffer is not None else None
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
@@ -737,6 +778,10 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
+                # JEPA 辅助损失更新 (独立 Predictor / Optimizer, 不影响 PPO Loss)
+                if args.use_jepa and jepa is not None and b_next_obs is not None:
+                    jepa.update(b_obs[mb_inds], b_next_obs[mb_inds], b_actions[mb_inds])
+
             # 如果KL散度超过阈值, 提前停止epoch
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -767,6 +812,9 @@ if __name__ == "__main__":
         for k, v in cumulative_times.items():
             logger.add_scalar(f"time/total_{k}", v, global_step)
         logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
+        # 记录 JEPA 辅助损失
+        if args.use_jepa and jepa is not None:
+            logger.add_scalar("losses/jepa_loss", jepa.get_last_loss(), global_step)
     
     # 保存最终模型和关闭环境
     if args.save_model and not args.evaluate:
