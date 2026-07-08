@@ -71,9 +71,9 @@ class Args:
     """是否让并行环境在终止时重置而不是截断时重置"""
     eval_partial_reset: bool = False
     """是否让并行评估环境在终止时重置而不是截断时重置"""
-    num_steps: int = 50
+    num_steps: int = 150
     """每次策略 rollout 在每个环境中运行的步数"""
-    num_eval_steps: int = 50
+    num_eval_steps: int = 150
     """评估期间在每个评估环境中运行的步数"""
     reconfiguration_freq: Optional[int] = None
     """训练期间重新配置环境的频率"""
