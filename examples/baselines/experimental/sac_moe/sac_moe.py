@@ -191,82 +191,253 @@ class ReplayBuffer:
 
 
 # 算法逻辑: 初始化智能体
-# 门控网络 (Gating Network), 用于选择专家
-class Gating(nn.Module): 
-    def __init__(self, input_dim, 
-                 num_experts, dropout_rate=0.1): 
-        super(Gating, self).__init__() 
+# =====================================================================
+# 门控网络 (Gating Network)
+# ---------------------------------------------------------------------
+# 在混合专家 (Mixture of Experts, MoE) 架构中，门控网络负责根据当前
+# 输入（状态或状态-动作对）为每个专家网络分配一个权重（重要性分数）。
+#
+# 工作流程：
+#   1. 接收与专家网络相同的输入特征；
+#   2. 通过多层全连接网络对输入进行非线性特征变换；
+#   3. 在输出层使用 softmax 将 logits 归一化为概率分布；
+#   4. 输出的权重向量将与各专家的输出逐一相乘并求和，得到最终结果。
+#
+# 网络结构（共 4 层全连接）：
+#   input_dim -> 128  (ReLU + Dropout)
+#          -> 256  (LeakyReLU + Dropout)
+#          -> 128  (LeakyReLU + Dropout)
+#          -> num_experts (Softmax)
+# 使用 Dropout 进行正则化，避免门控网络对某个专家过度依赖。
+# =====================================================================
+class Gating(nn.Module):
+    def __init__(self, input_dim,
+                 num_experts, dropout_rate=0.1):
+        """
+        门控网络的构造函数。
 
-        self.layer1 = nn.Linear(input_dim, 128) 
-        self.dropout1 = nn.Dropout(dropout_rate) 
+        参数:
+            input_dim (int): 输入特征的维度。
+                - 对于价值网络 (VNetwork) 场景: 输入为观测，维度 = obs.shape 的乘积
+                - 对于 Q 网络场景: 输入为观测与动作的拼接，维度 = obs.shape + action.shape
+            num_experts (int): 专家网络的数量，决定输出层的神经元个数。
+                每个输出对应一个专家的权重（重要性分数）。
+            dropout_rate (float): Dropout 概率，用于正则化并防止过拟合。
+                默认 0.1, 表示每个神经元有 10% 的概率在训练时被置零。
+        """
+        super(Gating, self).__init__()
 
-        self.layer2 = nn.Linear(128, 256) 
-        self.leaky_relu1 = nn.LeakyReLU() 
-        self.dropout2 = nn.Dropout(dropout_rate) 
+        # 第 1 层: 输入层 -> 128 维
+        # 使用 ReLU 激活函数引入非线性，随后接 Dropout 进行正则化
+        self.layer1 = nn.Linear(input_dim, 128)
+        self.dropout1 = nn.Dropout(dropout_rate)
 
-        self.layer3 = nn.Linear(256, 128) 
-        self.leaky_relu2 = nn.LeakyReLU() 
-        self.dropout3 = nn.Dropout(dropout_rate) 
+        # 第 2 层: 128 维 -> 256 维
+        # 使用 LeakyReLU（允许负值有微小梯度，缓解神经元"死亡"问题）
+        self.layer2 = nn.Linear(128, 256)
+        self.leaky_relu1 = nn.LeakyReLU()
+        self.dropout2 = nn.Dropout(dropout_rate)
 
-        self.layer4 = nn.Linear(128, num_experts) 
+        # 第 3 层: 256 维 -> 128 维
+        # 继续特征压缩，同样使用 LeakyReLU + Dropout
+        self.layer3 = nn.Linear(256, 128)
+        self.leaky_relu2 = nn.LeakyReLU()
+        self.dropout3 = nn.Dropout(dropout_rate)
 
-    def forward(self, x): 
-        x = torch.relu(self.layer1(x)) 
-        x = self.dropout1(x) 
+        # 第 4 层: 输出层，128 维 -> num_experts
+        # 输出每个专家的 logit（未归一化的分数），后续在 forward 中通过 softmax 转为权重
+        self.layer4 = nn.Linear(128, num_experts)
 
-        x = self.layer2(x) 
-        x = self.leaky_relu1(x) 
-        x = self.dropout2(x) 
+    def forward(self, x):
+        """
+        门控网络的前向传播。
 
-        x = self.layer3(x) 
-        x = self.leaky_relu2(x) 
-        x = self.dropout3(x) 
+        参数:
+            x (torch.Tensor): 输入特征，形状为 (batch_size, input_dim)。
 
+        返回:
+            torch.Tensor: 各专家的权重（概率分布），形状为 (batch_size, num_experts)。
+                所有权重沿 dim=1 求和为 1, 表示每个样本对所有专家的归一化分配比例。
+        """
+        # 第 1 层: 全连接 -> ReLU -> Dropout
+        x = torch.relu(self.layer1(x))
+        x = self.dropout1(x)
+
+        # 第 2 层: 全连接 -> LeakyReLU -> Dropout
+        x = self.layer2(x)
+        x = self.leaky_relu1(x)
+        x = self.dropout2(x)
+
+        # 第 3 层: 全连接 -> LeakyReLU -> Dropout
+        x = self.layer3(x)
+        x = self.leaky_relu2(x)
+        x = self.dropout3(x)
+
+        # 输出层: 全连接 -> Softmax
+        # 在专家维度 (dim=1) 上做 softmax，得到每个专家的归一化权重
         return torch.softmax(self.layer4(x), dim=1)
 
 
-# 混合专家网络
-class MoE(nn.Module): 
+# =====================================================================
+# 混合专家网络 (Mixture of Experts, MoE)
+# ---------------------------------------------------------------------
+# MoE 通过门控网络 (Gating Network) 动态地为每个输入样本分配多个专家
+# 网络的权重，并将各专家输出加权求和作为最终输出。
+#
+# 在本实现中，MoE 被用于构建价值网络 (V) 和 Q 网络 (Q) 的集成：
+#   - 价值网络场景: 输入为观测 obs，输出 V(s)
+#   - Q 网络场景: 输入为观测与动作的拼接 [obs, act]，输出 Q(s, a)
+#
+# 结构说明：
+#   - experts: 由 num_experts 个独立的专家网络组成的列表
+#   - gating: 门控网络，根据输入为每个专家生成归一化权重
+#
+# 前向传播流程：
+#   1. 若提供了动作 a，则将观测与动作在最后一维拼接
+#   2. 门控网络根据输入计算各专家权重 (batch_size, num_experts)
+#   3. 所有专家分别对同一输入进行计算，输出堆叠为 (batch_size, 1, num_experts)
+#   4. 将权重扩展到与专家输出相同的形状，逐元素相乘后求和
+#   5. 最终输出形状为 (batch_size, 1)，即加权后的集成结果
+# =====================================================================
+class MoE(nn.Module):
     def __init__(self, num_experts, expert_module, env):
-        super(MoE, self).__init__() 
+        """
+        混合专家网络的构造函数。
+
+        参数:
+            num_experts (int): 专家网络的数量。每个专家是一个独立的全连接网络，
+                通过门控网络的权重进行集成。
+            expert_module (nn.Module): 专家网络的类构造器，可以是 VNetwork 或 SoftQNetwork。
+                根据该类型自动推断门控网络的输入维度。
+            env: 环境对象，用于获取观测空间和动作空间的维度信息。
+        """
+        super(MoE, self).__init__()
+
+        # 根据专家类型确定门控网络的输入维度
+        # - 价值网络 (VNetwork): 输入仅为观测，维度 = obs.shape 的乘积
+        # - Q 网络 (SoftQNetwork): 输入为观测 + 动作，维度 = obs.shape + action.shape
         if expert_module == VNetwork:
             input_dim = np.prod(env.single_observation_space.shape)
         else:
             input_dim = np.prod(env.single_observation_space.shape) + np.prod(env.single_action_space.shape)
+
+        # 创建 num_experts 个独立的专家网络实例
+        # 每个专家网络结构相同但参数独立，通过各自的学习形成多样化的策略
         self.experts = nn.ModuleList([expert_module(env) for _ in range(num_experts)])
-        self.gating = Gating(input_dim, num_experts) 
+
+        # 门控网络，根据输入特征为每个专家分配权重
+        self.gating = Gating(input_dim, num_experts)
 
     def forward(self, x, a=None):
-        if a is not None:
-            x = torch.cat([x, a], dim=-1) 
-        weights = self.gating(x) 
-        outputs = torch.stack([expert(x) for expert in self.experts], dim=-1) 
-        weights = weights.unsqueeze(1).expand_as(outputs) 
-        return torch.sum(outputs * weights, dim=-1)
-     
+        """
+        混合专家网络的前向传播。
 
-# 价值网络
+        参数:
+            x (torch.Tensor): 观测张量，形状为 (batch_size, obs_dim)。
+            a (torch.Tensor, optional): 动作张量，形状为 (batch_size, action_dim)。
+                若提供(Q 网络场景)，则与观测在最后一维拼接后送入专家网络。
+
+        返回:
+            torch.Tensor: 加权集成后的输出，形状为 (batch_size, 1)。
+        """
+        # 若提供了动作，将观测与动作在最后一维拼接，形成 (batch_size, obs_dim + action_dim)
+        if a is not None:
+            x = torch.cat([x, a], dim=-1)
+
+        # 门控网络计算各专家权重: (batch_size, num_experts)
+        weights = self.gating(x)
+
+        # 所有专家分别对输入进行计算
+        # 每个 expert(x) 输出形状为 (batch_size, 1)
+        # 堆叠后形状为 (batch_size, 1, num_experts)
+        outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)
+
+        # 将权重扩展到与 outputs 相同的形状，以便逐元素相乘
+        # weights: (batch_size, num_experts) -> (batch_size, 1, num_experts)
+        weights = weights.unsqueeze(1).expand_as(outputs)
+
+        # 加权求和: 在专家维度 (dim=-1) 上求和
+        # 最终输出形状: (batch_size, 1)
+        return torch.sum(outputs * weights, dim=-1)
+
+
+# =====================================================================
+# 价值网络 (Value Network, VNetwork)
+# ---------------------------------------------------------------------
+# 价值网络用于估计状态的价值函数 V(s)，即从当前状态出发，遵循当前策略
+# 所能获得的期望累计回报。
+#
+# 在 SAC (Soft Actor-Critic) 算法中，价值网络作为额外的价值估计器，
+# 与 Q 网络的输出进行加权融合，用于稳定训练并加速收敛。
+#
+# 网络结构（4 层全连接）：
+#   obs_dim -> 256 -> 256 -> 256 -> 1
+# 每层之间使用 ReLU 激活函数，输出层不使用激活函数（输出实数）。
+# =====================================================================
 class VNetwork(nn.Module):
     def __init__(self, env):
+        """
+        价值网络的构造函数。
+
+        参数:
+            env: 环境对象，用于获取观测空间的维度信息。
+        """
         super().__init__()
+        # 构建全连接网络
+        # 输入维度: 观测空间形状的乘积 (obs_dim)
+        # 隐藏层: 3 层 256 维，使用 ReLU 激活函数
+        # 输出层: 1 维，表示状态价值 V(s)
         self.net = nn.Sequential(
             nn.Linear(np.array(env.single_observation_space.shape).prod(), 256),
             nn.ReLU(),
             nn.Linear(256, 256),
-            nn.ReLU(), 
+            nn.ReLU(),
             nn.Linear(256, 256),
-            nn.ReLU(), 
+            nn.ReLU(),
             nn.Linear(256, 1)
         )
 
     def forward(self, x):
+        """
+        价值网络的前向传播。
+
+        参数:
+            x (torch.Tensor): 观测张量，形状为 (batch_size, obs_dim)。
+
+        返回:
+            torch.Tensor: 状态价值估计，形状为 (batch_size, 1)。
+        """
         return self.net(x)
 
 
-# 软Q网络
+# =====================================================================
+# 软 Q 网络 (Soft Q Network)
+# ---------------------------------------------------------------------
+# 软 Q 网络用于估计状态-动作对的软 Q 值 Q(s, a)，即在最大熵强化学习
+# 框架下，从当前状态执行给定动作后，遵循最优策略所能获得的期望累计
+# 回报（包含熵奖励项）。
+#
+# 在 SAC 算法中，通常使用两个独立的 Q 网络（qf1, qf2）构成 Critic，
+# 并取两者的较小值来缓解 Q 值过估计问题（Clipped Double-Q Trick）。
+# 本实现中每个 Q 网络都是 MoE 结构，由多个专家网络组成。
+#
+# 网络结构（4 层全连接）：
+#   (obs_dim + action_dim) -> 256 -> 256 -> 256 -> 1
+# 每层之间使用 ReLU 激活函数，输出层不使用激活函数（输出实数）。
+# =====================================================================
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
+        """
+        软 Q 网络的构造函数。
+
+        参数:
+            env: 环境对象，用于获取观测空间和动作空间的维度信息。
+        """
         super().__init__()
+        # 构建全连接网络
+        # 输入维度: 观测空间形状乘积 + 动作空间形状乘积 (obs_dim + action_dim)
+        # 隐藏层: 3 层 256 维，使用 ReLU 激活函数
+        # 输出层: 1 维，表示软 Q 值 Q(s, a)
         self.net = nn.Sequential(
             nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 256),
             nn.ReLU(),
@@ -278,6 +449,16 @@ class SoftQNetwork(nn.Module):
         )
 
     def forward(self, x):
+        """
+        软 Q 网络的前向传播。
+
+        参数:
+            x (torch.Tensor): 状态-动作对张量，形状为 (batch_size, obs_dim + action_dim)。
+                通常由观测和动作在最后一维拼接而成。
+
+        返回:
+            torch.Tensor: 软 Q 值估计，形状为 (batch_size, 1)。
+        """
         return self.net(x)
 
 
